@@ -160,71 +160,190 @@ end
 
 -- Server-only functions
 if RunService:IsServer() then
-    local ExitedPlayers = {}
-    
-    -- Internal Save Function
-    function ProgressionManager._TriggerSave(player, isSync)
-        if player:GetAttribute("WipedProgression") == true then
-            return
+    -- ====================================================================
+    -- GÜVENLİ KAYIT SİSTEMİ (Session Lock)
+    -- * Veri başarıyla yüklenmeden ASLA kayıt yapılmaz (yükleme hatası = veri silinmesi riski).
+    -- * Kayıt kaydı üzerinde "SessionLock" tutulur: Lobi <-> Oyun ışınlanmasında iki sunucu
+    --   aynı anda yazıp birbirinin verisini ezemez. Yeni sunucu, eski sunucu kilidi bırakana kadar bekler.
+    -- * Kayıtlar birleştirilir (debounce) ve periyodik otomatik kayıt ile kilit tazelenir.
+    -- ====================================================================
+    local SESSION_ID = (game.JobId ~= "" and game.JobId) or ("studio-" .. tostring(os.time()))
+    local LOCK_STALE_SECONDS = 180 -- Bu süre boyunca tazelenmeyen kilit "terk edilmiş" sayılır
+    local LOAD_ATTEMPTS = 8
+    local LOAD_RETRY_DELAY = 2
+    local SAVE_DEBOUNCE = 5
+    local AUTOSAVE_INTERVAL = 60
+
+    local LoadedPlayers = {}   -- [UserId] = true: veri yüklendi ve kilit bu sunucuda
+    local ReleasedPlayers = {} -- [UserId] = true: çıkışta kilit bırakıldı
+    local SaveScheduled = {}   -- [UserId] = true: ertelenmiş kayıt bekliyor
+
+    local function buildSaveData(player)
+        local dataToSave = {}
+        for key in pairs(ProgressionManager.Quests) do
+            dataToSave[key] = player:GetAttribute("Unlocked_" .. key) == true
+            dataToSave["Progress_" .. key] = player:GetAttribute("Progress_" .. key) or 0
+            dataToSave["QuestCompleted_" .. key] = (player:GetAttribute("QuestCompleted_" .. key) == true) or (player:GetAttribute("Unlocked_" .. key) == true)
         end
-        if ExitedPlayers[player.UserId] == "Saved" then
-            return
-        end
-        if ExitedPlayers[player.UserId] == true then
-            ExitedPlayers[player.UserId] = "Saved"
-        end
-        
-        local function doSave()
-            local success, err = pcall(function()
-                local dataToSave = {}
-                for key in pairs(ProgressionManager.Quests) do
-                    dataToSave[key] = player:GetAttribute("Unlocked_" .. key) == true
-                    dataToSave["Progress_" .. key] = player:GetAttribute("Progress_" .. key) or 0
-                    dataToSave["QuestCompleted_" .. key] = (player:GetAttribute("QuestCompleted_" .. key) == true) or (player:GetAttribute("Unlocked_" .. key) == true)
+        dataToSave.Silver = math.floor(player:GetAttribute("Silver") or 0)
+        dataToSave.UnlockedDifficulties = {
+            Medium = (player:GetAttribute("DifficultyUnlocked_Medium") == true),
+            Hard = (player:GetAttribute("DifficultyUnlocked_Hard") == true)
+        }
+        dataToSave.Talents = {
+            WeaponSlots = player:GetAttribute("Talent_WeaponSlots") or 0,
+            PerkSlots = player:GetAttribute("Talent_PerkSlots") or 0,
+            FreeRerolls = player:GetAttribute("Talent_FreeRerolls") or 0,
+            Damage = player:GetAttribute("Talent_Damage") or 0,
+            Health = player:GetAttribute("Talent_Health") or 0,
+            Speed = player:GetAttribute("Talent_Speed") or 0,
+            Magnet = player:GetAttribute("Talent_Magnet") or 0,
+        }
+        return dataToSave
+    end
+
+    -- Kaydı DataStore'a yazar. releaseLock = true ise kilidi bırakır (oyuncu çıkarken).
+    local function writeSave(player, releaseLock)
+        local userId = player.UserId
+        if not LoadedPlayers[userId] then return false end
+
+        local dataToSave = buildSaveData(player)
+        local lostLock = false
+        local ok, err = pcall(function()
+            ProgressionDataStore:UpdateAsync(tostring(userId), function(old)
+                if type(old) == "table" and old.SessionLock and old.SessionLock ~= SESSION_ID then
+                    -- Başka bir sunucu kilidi devralmış: onun verisini EZME
+                    lostLock = true
+                    return nil
                 end
-                dataToSave.Silver = math.floor(player:GetAttribute("Silver") or 0)
-                dataToSave.UnlockedDifficulties = {
-                    Medium = (player:GetAttribute("DifficultyUnlocked_Medium") == true),
-                    Hard = (player:GetAttribute("DifficultyUnlocked_Hard") == true)
-                }
-                dataToSave.Talents = {
-                    WeaponSlots = player:GetAttribute("Talent_WeaponSlots") or 0,
-                    PerkSlots = player:GetAttribute("Talent_PerkSlots") or 0,
-                    FreeRerolls = player:GetAttribute("Talent_FreeRerolls") or 0,
-                    Damage = player:GetAttribute("Talent_Damage") or 0,
-                    Health = player:GetAttribute("Talent_Health") or 0,
-                    Speed = player:GetAttribute("Talent_Speed") or 0,
-                    Magnet = player:GetAttribute("Talent_Magnet") or 0,
-                }
-                ProgressionDataStore:SetAsync(tostring(player.UserId), dataToSave)
+                lostLock = false
+                dataToSave.SessionLock = (not releaseLock) and SESSION_ID or nil
+                dataToSave.SessionLockTime = os.time()
+                return dataToSave
             end)
-            if not success then
-                if ExitedPlayers[player.UserId] == "Saved" then
-                    ExitedPlayers[player.UserId] = true
-                end
-                warn("[ProgressionManager] Failed to save progression for " .. player.Name .. ": " .. tostring(err))
-            end
+        end)
+
+        if not ok then
+            warn("[ProgressionManager] Failed to save progression for " .. player.Name .. ": " .. tostring(err))
+            return false
         end
+        if lostLock then
+            warn("[ProgressionManager] Session lock for " .. player.Name .. " is held by another server; save skipped.")
+            LoadedPlayers[userId] = nil
+            return false
+        end
+        return true
+    end
+
+    -- Yalnızca kilidi bırakır, veriye dokunmaz (yükleme sırasında oyuncu çıkarsa)
+    local function releaseLockOnly(userId)
+        pcall(function()
+            ProgressionDataStore:UpdateAsync(tostring(userId), function(old)
+                if type(old) ~= "table" or old.SessionLock ~= SESSION_ID then return nil end
+                old.SessionLock = nil
+                return old
+            end)
+        end)
+    end
+
+    local function releasePlayer(player)
+        local userId = player.UserId
+        SaveScheduled[userId] = nil
+        if ReleasedPlayers[userId] or not LoadedPlayers[userId] then return end
+        ReleasedPlayers[userId] = true
+        writeSave(player, true)
+        LoadedPlayers[userId] = nil
+    end
+
+    -- Kayıt isteği: varsayılan olarak birkaç saniye birleştirilir (DataStore limitlerini korur).
+    -- isSync = true ise hemen ve beklenerek kaydeder.
+    function ProgressionManager._TriggerSave(player, isSync)
+        if not player then return end
+        local userId = player.UserId
+        if not LoadedPlayers[userId] or ReleasedPlayers[userId] then return end
 
         if isSync then
-            doSave()
-        else
-            task.spawn(doSave)
+            writeSave(player, false)
+            return
         end
+
+        if SaveScheduled[userId] then return end
+        SaveScheduled[userId] = true
+        task.delay(SAVE_DEBOUNCE, function()
+            if not SaveScheduled[userId] then return end
+            SaveScheduled[userId] = nil
+            if player.Parent and LoadedPlayers[userId] and not ReleasedPlayers[userId] then
+                writeSave(player, false)
+            end
+        end)
     end
 
     -- Load player progression
     function ProgressionManager.Load(player)
-        ExitedPlayers[player.UserId] = nil
-        local success, savedData = pcall(function()
-            return ProgressionDataStore:GetAsync(tostring(player.UserId))
-        end)
-        
+        local userId = player.UserId
+        ReleasedPlayers[userId] = nil
+        LoadedPlayers[userId] = nil
+
+        local savedData = nil
+        local loaded = false
+        for attempt = 1, LOAD_ATTEMPTS do
+            if not player.Parent then return end
+            local lockedByOther = false
+            local ok, err = pcall(function()
+                ProgressionDataStore:UpdateAsync(tostring(userId), function(old)
+                    local now = os.time()
+                    local isLastAttempt = attempt >= LOAD_ATTEMPTS
+                    if type(old) == "table" and old.SessionLock and old.SessionLock ~= SESSION_ID
+                        and (now - (tonumber(old.SessionLockTime) or 0)) < LOCK_STALE_SECONDS
+                        and not isLastAttempt then
+                        -- Önceki sunucu (lobi/oyun) henüz son kaydını bitirmedi: bekle
+                        lockedByOther = true
+                        return nil
+                    end
+                    lockedByOther = false
+                    local data = (type(old) == "table") and old or {}
+                    data.SessionLock = SESSION_ID
+                    data.SessionLockTime = now
+                    savedData = data
+                    return data
+                end)
+            end)
+
+            if ok and not lockedByOther then
+                loaded = true
+                break
+            end
+            if not ok then
+                warn(string.format("[ProgressionManager] Load attempt %d failed for %s: %s", attempt, player.Name, tostring(err)))
+                -- Studio'da DataStore erişimi kapalıysa boşuna bekleme
+                if RunService:IsStudio() then break end
+            end
+            task.wait(LOAD_RETRY_DELAY)
+        end
+
+        if loaded and not player.Parent then
+            -- Oyuncu yükleme sırasında çıktı: aldığımız kilidi geri bırak
+            releaseLockOnly(userId)
+            return
+        end
+
+        if loaded then
+            LoadedPlayers[userId] = true
+        else
+            -- KRİTİK: Yükleme başarısız. Boş veriyle oynatıp kaydedersek gerçek veriyi sileriz.
+            warn("[ProgressionManager] Could not load progression for " .. player.Name .. ". Saving is DISABLED for this session.")
+            player:SetAttribute("ProgressionLoadFailed", true)
+            if not RunService:IsStudio() then
+                player:Kick("We couldn't load your saved data. Please rejoin in a minute - your progress is safe.")
+                return
+            end
+        end
+
         local unlockedTable = {}
-        if success and type(savedData) == "table" then
+        if type(savedData) == "table" then
             unlockedTable = savedData
         end
-        
+
         -- Set attributes on the player for replication and ease of use
         for key, questData in pairs(ProgressionManager.Quests) do
             local isUnlocked = unlockedTable[key] == true
@@ -464,9 +583,6 @@ if RunService:IsServer() then
 
     -- İlerlemeyi / Index kayıtlarını tamamen sıfırla
     function ProgressionManager.Reset(player)
-        player:SetAttribute("WipedProgression", true)
-        ExitedPlayers[player.UserId] = "Saved"
-        
         for key in pairs(ProgressionManager.Quests) do
             player:SetAttribute("Unlocked_" .. key, false)
             player:SetAttribute("Progress_" .. key, 0)
@@ -486,34 +602,31 @@ if RunService:IsServer() then
         player:SetAttribute("Talent_Health", 0)
         player:SetAttribute("Talent_Speed", 0)
         player:SetAttribute("Talent_Magnet", 0)
-        
-        local success, err = pcall(function()
-            if ProgressionDataStore then
-                ProgressionDataStore:RemoveAsync(tostring(player.UserId))
-            end
-        end)
-        
-        if not success then
-            warn("[ProgressionManager] Failed to remove progression for " .. player.Name .. ": " .. tostring(err))
-        end
-        return success
+
+        -- Sıfırlanmış veriyi hemen kaydet (kilit korunur; oturumun geri kalanında kayıt normal devam eder)
+        SaveScheduled[player.UserId] = nil
+        return writeSave(player, false)
     end
 
     -- ====================================================================
     -- ADMIN KOMUTU: /silver [oyuncu] [miktar]
     -- ====================================================================
+    -- NOT: Grup oyunlarında game.CreatorId GRUP ID'sidir. Bu yüzden UserId == CreatorId
+    -- karşılaştırması YALNIZCA oyun bir kullanıcıya aitse yapılır (aksi halde UserId'si
+    -- grup ID'sine denk gelen rastgele bir oyuncu admin olurdu).
     local function isPlayerAdmin(player)
         if not player then return false end
         if RunService:IsStudio() then return true end
-        if game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then return true end
-        if game.CreatorId > 0 and player.UserId == game.CreatorId then return true end
-        if game.CreatorType == Enum.CreatorType.Group then
+        if game.CreatorType == Enum.CreatorType.User then
+            if player.UserId == game.CreatorId then return true end
+        elseif game.CreatorType == Enum.CreatorType.Group then
             local success, rank = pcall(function() return player:GetRankInGroup(game.CreatorId) end)
             if success and rank >= 250 then return true end
         end
         if player:GetAttribute("IsAdmin") == true then return true end
         return false
     end
+    ProgressionManager.IsAdmin = isPlayerAdmin
 
     local function findPlayer(query, senderPlayer)
         if not query or query == "" then return nil end
@@ -671,17 +784,37 @@ if RunService:IsServer() then
         return ProgressionManager.UnlockIndexItem(player, itemKey)
     end
 
-    -- Oyuncu oyundan çıktığında kaydet
+    -- Oyuncu oyundan çıktığında kaydet ve kilidi bırak (sonraki sunucu hemen yükleyebilsin)
     Players.PlayerRemoving:Connect(function(player)
-        ExitedPlayers[player.UserId] = true
-        ProgressionManager._TriggerSave(player)
+        releasePlayer(player)
     end)
 
-    -- Sunucu/Studio kapandığında aktif tüm oyuncuları kaydet
+    -- Periyodik otomatik kayıt: veriyi korur ve session lock'u taze tutar
+    task.spawn(function()
+        while true do
+            task.wait(AUTOSAVE_INTERVAL)
+            for _, player in ipairs(Players:GetPlayers()) do
+                if LoadedPlayers[player.UserId] and not ReleasedPlayers[player.UserId] then
+                    SaveScheduled[player.UserId] = nil
+                    task.spawn(writeSave, player, false)
+                end
+            end
+        end
+    end)
+
+    -- Sunucu/Studio kapandığında aktif tüm oyuncuları paralel kaydet ve bitmesini bekle
     game:BindToClose(function()
+        local pending = 0
         for _, player in ipairs(Players:GetPlayers()) do
-            ExitedPlayers[player.UserId] = true
-            ProgressionManager._TriggerSave(player, true)
+            pending = pending + 1
+            task.spawn(function()
+                releasePlayer(player)
+                pending = pending - 1
+            end)
+        end
+        local start = os.clock()
+        while pending > 0 and os.clock() - start < 25 do
+            task.wait(0.1)
         end
     end)
 end

@@ -533,32 +533,9 @@ local function extractPlayerStats(player)
         kills = math.max(kills, tonumber(attrKills))
     end
 
-    -- 4. TeleportData kontrolü (Oyundan lobiye dönüldüğünde gelen veriler)
-    local success, joinData = pcall(function() return player:GetJoinData() end)
-    if success and joinData and joinData.TeleportData then
-        local td = joinData.TeleportData
-        if type(td) == "table" then
-            local tdSilver = td.Silver or td.TotalSilver or td.silver
-            if tdSilver and tonumber(tdSilver) then
-                silver = math.max(silver, tonumber(tdSilver))
-            end
-            local tdCoins = td.Coins or td.Gold or td.TotalCoins or td.TotalGold or td.coins or td.gold
-            if tdCoins and tonumber(tdCoins) then
-                coins = math.max(coins, tonumber(tdCoins))
-            end
-            local tdKills = td.Kills or td.TotalKills or td.kills or td.totalKills
-            if tdKills and tonumber(tdKills) then
-                kills = math.max(kills, tonumber(tdKills))
-            end
-            if td.DefeatedEnemies and type(td.DefeatedEnemies) == "table" then
-                local sum = 0
-                for _, count in pairs(td.DefeatedEnemies) do
-                    sum = sum + (tonumber(count) or 0)
-                end
-                kills = math.max(kills, sum)
-            end
-        end
-    end
+    -- NOT: TeleportData BİLİNÇLİ OLARAK okunmaz. TeleportData istemciden geçer ve hileyle
+    -- değiştirilebilir; global sıralamaya sahte skor yazılmasına yol açar. Oyun sunucusu
+    -- maç skorlarını (Coins / Kills) zaten doğrudan kendi DataStore'larına kaydediyor.
 
     return silver, kills, coins
 end

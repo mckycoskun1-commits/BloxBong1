@@ -361,7 +361,13 @@ TogglePauseEvent.OnServerEvent:Connect(function(player)
         return
     end
 
+    -- GÜVENLİK: Çok oyunculu maçta tek bir oyuncu oyunu herkes için durduramaz (trol koruması).
+    -- Manuel duraklatma yalnızca tek kişilik oyunlarda kullanılabilir.
     local isCurrentlyManual = ReplicatedStorage:GetAttribute("IsManualPaused") == true
+    if #Players:GetPlayers() > 1 and not isCurrentlyManual then
+        ShowMessageEvent:FireClient(player, "Pause is only available in solo games.", Color3.fromRGB(255, 200, 50))
+        return
+    end
     local nextPauseState = not isCurrentlyManual
     
     ReplicatedStorage:SetAttribute("IsManualPaused", nextPauseState)
@@ -416,38 +422,32 @@ ApplyUpgradeEvent.OnServerEvent:Connect(function(player, upgradeType, bonusValue
     if upgradeType ~= "Skip" then
         local success, err = pcall(function()
             local data = PlayerData[player.UserId]
+
+            -- GÜVENLİK: Kart yalnızca sunucunun bu oyuncuya sunduğu tekliflerden (ActiveOffers) seçilebilir.
+            -- İstemciden gelen bonusValue YOK SAYILIR; değer her zaman sunucudaki tekliften okunur.
             local foundOffer = nil
-            if data and data.ActiveOffers then
+            if data and data.ActiveOffers and type(upgradeType) == "string" then
                 for _, offer in ipairs(data.ActiveOffers) do
-                    if offer.Key == upgradeType and (subKey == nil or offer.SubKey == subKey or offer.MilestoneKey == subKey) then
+                    if offer.Key == upgradeType and offer.SubKey == subKey then
                         foundOffer = offer
                         break
                     end
                 end
-                if not foundOffer then
-                    for _, offer in ipairs(data.ActiveOffers) do
-                        if (subKey and (offer.SubKey == subKey or offer.MilestoneKey == subKey)) or (upgradeType == "TurretMilestone" and offer.IsMilestone) then
-                            foundOffer = offer
-                            break
-                        end
-                    end
-                end
+            end
+            if not foundOffer then
+                warn(player.Name .. " sent an upgrade that was not offered: " .. tostring(upgradeType) .. " / " .. tostring(subKey))
+                return
             end
 
-            local isMilestoneUpgrade = (foundOffer and foundOffer.IsMilestone)
-                or (upgradeType == "TurretMilestone")
-                or (UpgradeConfig.TurretMilestones and UpgradeConfig.TurretMilestones[upgradeType] ~= nil)
-                or (subKey and UpgradeConfig.TurretMilestones and UpgradeConfig.TurretMilestones[subKey] ~= nil)
+            upgradeType = foundOffer.Key
+            subKey = foundOffer.SubKey
+            bonusValue = foundOffer.Value
 
             -- TARET DÖNÜM NOKTASI (MILESTONE / OVERCLOCK) SEÇİMİ
-            if isMilestoneUpgrade then
-                local mKey = (foundOffer and (foundOffer.SubKey or foundOffer.MilestoneKey))
-                    or (UpgradeConfig.TurretMilestones and UpgradeConfig.TurretMilestones[subKey] and subKey)
-                    or (UpgradeConfig.TurretMilestones and UpgradeConfig.TurretMilestones[upgradeType] and upgradeType)
-                    or "MinigunTurret"
-                local rName = (foundOffer and foundOffer.RarityName) or "Rare"
-                local mDef = UpgradeConfig.TurretMilestones and UpgradeConfig.TurretMilestones[mKey]
-                local stats = (foundOffer and foundOffer.MilestoneStats) or (mDef and mDef.Rarities and (mDef.Rarities[rName] or mDef.Rarities["Rare"]))
+            if foundOffer.IsMilestone then
+                local mKey = foundOffer.MilestoneKey or foundOffer.SubKey
+                local rName = foundOffer.RarityName or "Rare"
+                local stats = foundOffer.MilestoneStats
 
                 if stats then
                     if stats.Damage then
@@ -1219,6 +1219,70 @@ local function applyTalentsToPlayerData(player)
     data.FreeRerolls = talentFreeRerolls
 end
 
+-- ====================================================================
+-- GÜVENLİ MAÇ AYARI (Lobi -> Oyun)
+-- Lobi, rezerve sunucunun PrivateServerId'si anahtarıyla MemoryStore'a maç ayarını yazar.
+-- TeleportData istemciden geçtiği için değiştirilebilir; yalnızca yedek olarak ve doğrulanarak kullanılır.
+-- ====================================================================
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local MatchConfigStore = MemoryStoreService:GetSortedMap("MatchConfigs_V1")
+local DifficultyConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("DifficultyConfig"))
+
+local cachedMatchConfig = nil
+local matchConfigState = "idle" -- idle | loading | done
+
+local function getTrustedMatchConfig()
+    if matchConfigState == "done" then return cachedMatchConfig end
+    if matchConfigState == "loading" then
+        while matchConfigState == "loading" do task.wait(0.1) end
+        return cachedMatchConfig
+    end
+
+    matchConfigState = "loading"
+    -- Yalnızca lobinin rezerve ettiği sunucularda (özel sunucu sahibi yok) MemoryStore kaydı bulunur
+    if game.PrivateServerId ~= "" and game.PrivateServerOwnerId == 0 then
+        for attempt = 1, 5 do
+            local ok, result = pcall(function()
+                return MatchConfigStore:GetAsync(game.PrivateServerId)
+            end)
+            if ok then
+                if type(result) == "table" then
+                    cachedMatchConfig = result
+                end
+                break
+            end
+            warn("[GameServer] MatchConfig read attempt " .. attempt .. " failed: " .. tostring(result))
+            task.wait(1)
+        end
+    end
+    matchConfigState = "done"
+    return cachedMatchConfig
+end
+
+local function sanitizeDifficulty(player, difficultyId, isTrusted)
+    if type(difficultyId) ~= "string" or not DifficultyConfig.Difficulties[difficultyId] then
+        return "Easy"
+    end
+    if not isTrusted then
+        -- Güvenilmeyen kaynak: zorluk kilidinin gerçekten açık olduğunu doğrula
+        if not player:GetAttribute("ProgressionLoaded") or not ProgressionManager.IsDifficultyUnlocked(player, difficultyId) then
+            return "Easy"
+        end
+    end
+    return difficultyId
+end
+
+local function sanitizeMapId(mapId)
+    if type(mapId) == "string" then
+        for _, mapData in ipairs(LobbyConfig.UI.Maps) do
+            if mapData.Id == mapId then
+                return mapId
+            end
+        end
+    end
+    return "Forest"
+end
+
 local function initializePlayer(player)
     -- Kalıcı Geliştirmelerin (Progression / Talents) DataStore'dan yüklenmesini bekle (en fazla 2.5 saniye)
     if not player:GetAttribute("ProgressionLoaded") then
@@ -1243,28 +1307,25 @@ local function initializePlayer(player)
     levelVal.Value = 1
     levelVal.Parent = leaderstats
 
-    -- Sınıf Verilerini Al (TeleportData'dan veya Varsayılan)
+    -- Maç Ayarlarını Al: Önce güvenilir kaynak (MemoryStore), yoksa doğrulanmış TeleportData
     local joinData = player:GetJoinData()
     local teleportData = joinData and joinData.TeleportData
-    local isFromLobby = (teleportData and teleportData.PlayerClasses) and true or false
+    local trustedConfig = getTrustedMatchConfig()
+    local isTrustedConfig = trustedConfig ~= nil
+    local matchConfig = trustedConfig or ((type(teleportData) == "table") and teleportData or nil)
+    local isFromLobby = (matchConfig and type(matchConfig.PlayerClasses) == "table") and true or false
 
-    -- Zorluk ve Harita Bilgisini Global Olarak Ata
-    if teleportData and teleportData.Difficulty then
-        if not workspace:GetAttribute("Difficulty") then
-            workspace:SetAttribute("Difficulty", teleportData.Difficulty)
-            print("[GameServer] Lobi Seçimi - Zorluk: " .. tostring(teleportData.Difficulty))
-        end
-    elseif not workspace:GetAttribute("Difficulty") then
-        workspace:SetAttribute("Difficulty", "Easy")
+    -- Zorluk ve Harita Bilgisini Global Olarak Ata (izin verilen listelere göre doğrulanmış)
+    if not workspace:GetAttribute("Difficulty") then
+        local difficulty = sanitizeDifficulty(player, matchConfig and matchConfig.Difficulty, isTrustedConfig)
+        workspace:SetAttribute("Difficulty", difficulty)
+        print("[GameServer] Lobi Seçimi - Zorluk: " .. difficulty .. (isTrustedConfig and "" or " (TeleportData fallback)"))
     end
 
-    if teleportData and teleportData.MapId then
-        if not workspace:GetAttribute("MapId") then
-            workspace:SetAttribute("MapId", teleportData.MapId)
-            print("[GameServer] Lobi Seçimi - Harita: " .. tostring(teleportData.MapId))
-        end
-    elseif not workspace:GetAttribute("MapId") then
-        workspace:SetAttribute("MapId", "Forest")
+    if not workspace:GetAttribute("MapId") then
+        local mapId = sanitizeMapId(matchConfig and matchConfig.MapId)
+        workspace:SetAttribute("MapId", mapId)
+        print("[GameServer] Lobi Seçimi - Harita: " .. mapId)
     end
     
     -- Eğer oyuncu lobiden ışınlanarak gelmediyse (örn: Roblox profilinden doğrudan arkadaşına katıldıysa)
@@ -1290,8 +1351,8 @@ local function initializePlayer(player)
         end
     end
     
-    local selectedClassId = teleportData and teleportData.PlayerClasses and teleportData.PlayerClasses[tostring(player.UserId)] or "Human"
-    
+    local selectedClassId = matchConfig and type(matchConfig.PlayerClasses) == "table" and matchConfig.PlayerClasses[tostring(player.UserId)] or "Human"
+
     local selectedClassData = nil
     for _, c in ipairs(CharacterUIConfig.Characters) do
         if c.Id == selectedClassId then
@@ -1299,10 +1360,12 @@ local function initializePlayer(player)
             break
         end
     end
-    
+
     if not selectedClassData then
         selectedClassData = CharacterUIConfig.Characters[1] -- Fallback
     end
+    -- Geçersiz bir sınıf ID'si geldiyse veride de fallback sınıfı kullan
+    selectedClassId = selectedClassData.Id
 
     player:SetAttribute("SelectedClass", selectedClassData.Name)
     player:SetAttribute("SelectedClassId", selectedClassData.Id)
@@ -1507,11 +1570,7 @@ local function initializePlayer(player)
     
     player.Chatted:Connect(function(msg)
         -- Admin Kontrolü (Studio Testi veya Oyun Sahibi / CreatorId / Grup Yetkilisi)
-        local isAdmin = RunService:IsStudio() 
-            or (game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId)
-            or (game.CreatorType == Enum.CreatorType.Group and pcall(function() return player:GetRankInGroup(game.CreatorId) end) and player:GetRankInGroup(game.CreatorId) >= 250)
-            or (game.CreatorId > 0 and player.UserId == game.CreatorId)
-        if not isAdmin then return end
+        if not ProgressionManager.IsAdmin(player) then return end
         
         local lowerMsg = string.lower(msg)
         local args = string.split(lowerMsg, " ")
@@ -2906,7 +2965,12 @@ end)
 ContinueEvent.OnServerEvent:Connect(function(player)
     local data = PlayerData[player.UserId]
     if not data then return end
-    
+
+    -- GÜVENLİK: Yalnızca maç bittikten sonra ve düşmüş oyuncu için geçerlidir.
+    -- (Aksi halde istemci bu olayı istediği an tetikleyip canını doldurabilir.)
+    if ReplicatedStorage:GetAttribute("GameStarted") == true then return end
+    if not data.IsDowned and (data.Health or 0) > 0 then return end
+
     -- print(player.Name .. " chose Continue, respawning...")
     
     -- Canı doldur ve düşme durumunu kaldır

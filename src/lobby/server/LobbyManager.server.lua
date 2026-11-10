@@ -3,7 +3,11 @@ local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 local DataStoreService = game:GetService("DataStoreService")
 
+local MemoryStoreService = game:GetService("MemoryStoreService")
+
 local ClassDataStore = DataStoreService:GetDataStore("PlayerClassData_V1")
+-- Lobi -> Oyun sunucusu güvenli maç ayarı aktarımı (anahtar: rezerve sunucunun PrivateServerId'si)
+local MatchConfigStore = MemoryStoreService:GetSortedMap("MatchConfigs_V1")
 
 local LobbyConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("LobbyConfig"))
 
@@ -365,20 +369,42 @@ CreateLobby.OnServerEvent:Connect(function(player, capacity, mapId, difficultyId
     local lobby = PlayerToLobby[player]
     if not lobby or lobby.Host ~= player or lobby.State ~= "Configuring" then return end
 
+    -- GÜVENLİK: İstemciden gelen tüm değerleri izin verilen listelere göre doğrula
     local ProgressionManager = require(ReplicatedStorage.Shared.ProgressionManager)
-    local validDifficulty = difficultyId or "Easy"
-    if not ProgressionManager.IsDifficultyUnlocked(player, validDifficulty) then
-        validDifficulty = "Easy"
+    local DifficultyConfig = require(ReplicatedStorage.Shared.DifficultyConfig)
+
+    local validDifficulty = "Easy"
+    if type(difficultyId) == "string" and DifficultyConfig.Difficulties[difficultyId]
+        and ProgressionManager.IsDifficultyUnlocked(player, difficultyId) then
+        validDifficulty = difficultyId
     end
 
-    lobby.MaxPlayers = capacity or 2
-    lobby.MapId = mapId or "Forest"
+    local validCapacity = 2
+    if type(capacity) == "number" and table.find(LobbyConfig.UI.PlayerOptions, capacity) then
+        validCapacity = capacity
+    end
+
+    local validMapId = "Forest"
+    if type(mapId) == "string" then
+        for _, mapData in ipairs(LobbyConfig.UI.Maps) do
+            if mapData.Id == mapId then
+                validMapId = mapId
+                break
+            end
+        end
+    end
+
+    local character = player.Character
+    if not character then return end
+
+    lobby.MaxPlayers = validCapacity
+    lobby.MapId = validMapId
     lobby.Difficulty = validDifficulty
     lobby.FriendsOnly = (isFriendsOnly == true)
     lobby.State = "Waiting"
     lobby.Countdown = 30
     table.insert(lobby.CurrentPlayers, player)
-    player.Character:PivotTo(lobby.Part.CFrame + Vector3.new(0, 3, 0))
+    character:PivotTo(lobby.Part.CFrame + Vector3.new(0, 3, 0))
 
     -- EĞER ODA ANINDA DOLDUYSA (Örn: 1 Kişilik oda), SÜREYİ 10'A DÜŞÜR
     if #lobby.CurrentPlayers >= lobby.MaxPlayers then
@@ -414,19 +440,30 @@ CreateLobby.OnServerEvent:Connect(function(player, capacity, mapId, difficultyId
                 local teleportOptions = Instance.new("TeleportOptions")
                 
                 -- Her lobi grubuna özel, taze bir sunucu ayır (ReserveServer)
-                local accessCode = TeleportService:ReserveServer(LobbyConfig.GamePlaceId or 0)
+                local accessCode, privateServerId = TeleportService:ReserveServer(LobbyConfig.GamePlaceId or 0)
                 teleportOptions.ReservedServerAccessCode = accessCode
-                
-                -- Karakter Sınıflarını, Haritayı ve Zorluğu TeleportData olarak ekle
+
+                -- Karakter Sınıfları, Harita ve Zorluk
                 local playerClassMap = {}
                 for _, p in ipairs(lobby.CurrentPlayers) do
                     playerClassMap[tostring(p.UserId)] = p:GetAttribute("SelectedClassId") or "Human"
                 end
-                teleportOptions:SetTeleportData({
+                local matchConfig = {
                     PlayerClasses = playerClassMap,
                     MapId = lobby.MapId or "Forest",
                     Difficulty = lobby.Difficulty or "Easy"
-                })
+                }
+
+                -- GÜVENLİK: TeleportData istemciden geçtiği için değiştirilebilir.
+                -- Asıl maç ayarı sunucular arası MemoryStore'a (rezerve sunucu ID'si anahtarıyla) yazılır;
+                -- oyun sunucusu ayarı buradan okur. TeleportData yalnızca MemoryStore çökerse yedek olarak kullanılır.
+                local storeOk, storeErr = pcall(function()
+                    MatchConfigStore:SetAsync(privateServerId, matchConfig, 3600)
+                end)
+                if not storeOk then
+                    warn("[LobbyManager] MatchConfig MemoryStore write failed: " .. tostring(storeErr))
+                end
+                teleportOptions:SetTeleportData(matchConfig)
                 
                 TeleportService:TeleportAsync(LobbyConfig.GamePlaceId or 0, lobby.CurrentPlayers, teleportOptions)
             end)
