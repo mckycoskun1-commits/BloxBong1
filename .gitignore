@@ -9,3 +9,7 @@ sourcemap.json
 
 # Paralel AI oturumlarının git worktree klasörleri
 /.claude/worktrees/
+
+# Rojo build çıktıları
+*.rbxl
+*.rbxlx
