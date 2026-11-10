@@ -1018,7 +1018,7 @@ local function castBossAbility(bossPart, data)
                 if root and not char:GetAttribute("IsDowned") then
                     local dist = (root.Position - targetPos).Magnitude
                     if dist <= radius then
-                        Events.TakeDamage:Fire(p, math.round(data.Damage * 1.5), targetPos, hitbox)
+                        Events.TakeDamage:Fire(p, math.round(data.Damage * 1.5), targetPos, bossPart)
                     end
                 end
             end

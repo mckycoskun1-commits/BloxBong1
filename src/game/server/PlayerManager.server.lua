@@ -2128,10 +2128,11 @@ function triggerLevelUp(player, data, forcedRarity, forcedUpgradeKey, isReroll)
             rarityData = rollRarity(luck)
         end
         
+        local validSubStats = nil
         if isUnlocking then
             chosenSubStat = {Name = "Unlock", Display = "Unlock"}
         elseif base.SubStats then
-            local validSubStats = {}
+            validSubStats = {}
             for _, ss in ipairs(base.SubStats) do
                 if ss.Name == "TurretCostReduction" and (data.TurretCost or 100) <= 15 then
                     -- Taret hurda maliyeti taban seviyede (<= 15) ise artık maliyet düşürme çıkarma
