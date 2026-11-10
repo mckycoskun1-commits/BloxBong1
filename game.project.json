@@ -1,0 +1,27 @@
+{
+  "name": "Roblox Tower Defence - Game",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Shared": {
+        "$path": "src/shared"
+      }
+    },
+    "ServerScriptService": {
+      "Server": {
+        "$path": "src/game/server"
+      }
+    },
+    "StarterPlayer": {
+      "$properties": {
+        "CameraMinZoomDistance": 5,
+        "CameraMaxZoomDistance": 30
+      },
+      "StarterPlayerScripts": {
+        "Client": {
+          "$path": "src/game/client"
+        }
+      }
+    }
+  }
+}

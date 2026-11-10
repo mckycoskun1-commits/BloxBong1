@@ -1,0 +1,2 @@
+-- Bu dosya artık HealthUIController.client.lua içine taşınmıştır.
+-- Gereksiz bağlantılar kaldırıldı.
