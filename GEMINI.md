@@ -7,6 +7,12 @@
   - `os.clock()` veya zaman farkı (`elapsed`) bazlı çalışan tüm zamanlayıcılarda, oyun duraklatıldığında geçen duraklatma süresini (`pauseDuration`) ilgili zaman damgalarına ekle/kaydır (shift timers).
   - Fizik, hareket, mermiler, parçacıklar ve görsel animasyonlar oyun durduğunda dondurulmalı, duraklatma bittiğinde hiçbir gecikme, ani teleport/fırlama veya zamansal taşma olmadan pürüzsüzce devam etmelidir.
 
+- **Paralel Oturum / Git İzolasyonu (Kod Ezmeyi Önleme)**: Bu klasörde aynı anda birden fazla AI oturumu (Claude, Gemini vb.) çalışabilir. Birbirinin kodunu ezmemek için:
+  - Paralel çalışan her oturum kendi **git worktree + branch**'inde çalışır. Claude Code masaüstünde yeni oturumu "worktree" seçeneği açık başlat (worktree'ler `.claude/worktrees/` altında, gitignore'da). Elle: `git worktree add .claude/worktrees/<isim> -b <isim>`.
+  - Ana klasörde (`main`) çalışan oturum, dosya düzenlemeden önce `git status` çalıştırır. Kendisinin yapmadığı commit edilmemiş değişiklik varsa başka bir oturum aktif demektir: o dosyalara dokunma, kullanıcıya sor veya worktree'ye geç.
+  - Her anlamlı adımın sonunda değişiklikleri kendi branch'ine commit et; commit edilmemiş iş başka oturumlar tarafından ezilebilir. Branch'ler `main`'e yalnızca kullanıcı onayıyla merge edilir.
+  - Rojo: `rojo serve` hangi klasörden çalıştırılırsa o klasörün kodunu Studio'ya sync eder; aynı portta tek seferde yalnız bir `rojo serve` çalışabilir.
+
 # Proje Dosya ve Sistem Haritası (Hızlı Erişim)
 
 Arama yapmadan doğrudan ilgili dosyaya gitmek için bu dizini referans al:
